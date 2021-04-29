@@ -3,6 +3,7 @@ package org.enso.languageserver.search
 import java.util.UUID
 
 import akka.actor.{Actor, ActorLogging, ActorRef, Props, Stash}
+import akka.event.LoggingReceive
 import akka.pattern.{ask, pipe}
 import org.enso.languageserver.capability.CapabilityProtocol.{
   AcquireCapability,
@@ -118,283 +119,316 @@ final class SuggestionsHandler(
   override def receive: Receive =
     initializing(SuggestionsHandler.Initialization())
 
-  def initializing(init: SuggestionsHandler.Initialization): Receive = {
-    case ProjectNameChangedEvent(oldName, newName) =>
-      log.info(s"Initializing: project name changed from $oldName to $newName.")
-      suggestionsRepo
-        .renameProject(oldName, newName)
-        .map(_ => ProjectNameUpdated(newName))
-        .pipeTo(self)
-
-    case ProjectNameUpdated(name, updates) =>
-      log.info(s"Initializing: project name is updated to $name.")
-      updates.foreach(sessionRouter ! _)
-      tryInitialize(init.copy(project = Some(name)))
-
-    case InitializedEvent.SuggestionsRepoInitialized =>
-      log.info(s"Initializing: suggestions repo initialized.")
-      tryInitialize(
-        init.copy(suggestions =
-          Some(InitializedEvent.SuggestionsRepoInitialized)
+  def initializing(init: SuggestionsHandler.Initialization): Receive =
+    LoggingReceive.withLabel("initializing") {
+      case ProjectNameChangedEvent(oldName, newName) =>
+        log.info(
+          s"Initializing: project name changed from $oldName to $newName."
         )
-      )
+        suggestionsRepo
+          .renameProject(oldName, newName)
+          .map(_ => ProjectNameUpdated(newName))
+          .pipeTo(self)
 
-    case InitializedEvent.TruffleContextInitialized =>
-      log.info(s"Initializing: Truffle context initialized.")
-      val requestId = UUID.randomUUID()
-      runtimeConnector
-        .ask(Api.Request(requestId, Api.GetTypeGraphRequest()))(timeout, self)
-        .pipeTo(self)
+      case ProjectNameUpdated(name, updates) =>
+        log.info(s"Initializing: project name is updated to $name.")
+        updates.foreach(sessionRouter ! _)
+        tryInitialize(init.copy(project = Some(name)))
 
-    case Api.Response(_, Api.GetTypeGraphResponse(g)) =>
-      log.info(s"Initializing: got type graph response.")
-      tryInitialize(init.copy(typeGraph = Some(g)))
+      case InitializedEvent.SuggestionsRepoInitialized =>
+        log.info(s"Initializing: suggestions repo initialized.")
+        tryInitialize(
+          init.copy(suggestions =
+            Some(InitializedEvent.SuggestionsRepoInitialized)
+          )
+        )
 
-    case _ => stash()
-  }
+      case InitializedEvent.TruffleContextInitialized =>
+        log.info(s"Initializing: Truffle context initialized.")
+        val requestId = UUID.randomUUID()
+        runtimeConnector
+          .ask(Api.Request(requestId, Api.GetTypeGraphRequest()))(timeout, self)
+          .pipeTo(self)
+
+      case Api.Response(_, Api.GetTypeGraphResponse(g)) =>
+        log.info(s"Initializing: got type graph response.")
+        tryInitialize(init.copy(typeGraph = Some(g)))
+
+      case _ => stash()
+    }
 
   def verifying(
     projectName: String,
     graph: TypeGraph
-  ): Receive = {
-    case Api.Response(_, Api.VerifyModulesIndexResponse(toRemove)) =>
-      log.info(s"Verifying: got verification response.")
-      suggestionsRepo
-        .removeModules(toRemove)
-        .map(_ => SuggestionsHandler.Verified)
-        .pipeTo(self)
+  ): Receive =
+    LoggingReceive.withLabel("verifying") {
+      case Api.Response(_, Api.VerifyModulesIndexResponse(toRemove)) =>
+        log.info(s"Verifying: got verification response.")
+        suggestionsRepo
+          .removeModules(toRemove)
+          .map(_ => SuggestionsHandler.Verified)
+          .pipeTo(self)
 
-    case SuggestionsHandler.Verified =>
-      log.info(s"Verified.")
-      context.become(initialized(projectName, graph, Set()))
-      unstashAll()
+      case SuggestionsHandler.Verified =>
+        log.info(s"Verified.")
+        context.become(initialized(projectName, graph, Set()))
+        unstashAll()
 
-    case _ =>
-      stash()
-  }
+      case _ =>
+        stash()
+    }
 
   def initialized(
     projectName: String,
     graph: TypeGraph,
     clients: Set[ClientId]
-  ): Receive = {
-    case AcquireCapability(
-          client,
-          CapabilityRegistration(ReceivesSuggestionsDatabaseUpdates())
-        ) =>
-      sender() ! CapabilityAcquired
-      context.become(initialized(projectName, graph, clients + client.clientId))
+  ): Receive =
+    LoggingReceive.withLabel("initialized") {
+      case AcquireCapability(
+            client,
+            CapabilityRegistration(ReceivesSuggestionsDatabaseUpdates())
+          ) =>
+        sender() ! CapabilityAcquired
+        context.become(
+          initialized(projectName, graph, clients + client.clientId)
+        )
 
-    case ReleaseCapability(
-          client,
-          CapabilityRegistration(ReceivesSuggestionsDatabaseUpdates())
-        ) =>
-      sender() ! CapabilityReleased
-      context.become(initialized(projectName, graph, clients - client.clientId))
+      case ReleaseCapability(
+            client,
+            CapabilityRegistration(ReceivesSuggestionsDatabaseUpdates())
+          ) =>
+        sender() ! CapabilityReleased
+        context.become(
+          initialized(projectName, graph, clients - client.clientId)
+        )
 
-    case msg: Api.SuggestionsDatabaseModuleUpdateNotification =>
-      val isVersionChanged =
-        fileVersionsRepo.getVersion(msg.file).map { digestOpt =>
-          !digestOpt.map(ContentVersion(_)).contains(msg.version)
-        }
-      val applyUpdatesIfVersionChanged =
-        isVersionChanged.flatMap { isChanged =>
-          if (isChanged) applyDatabaseUpdates(msg).map(Some(_))
-          else Future.successful(None)
-        }
-      applyUpdatesIfVersionChanged
-        .onComplete {
-          case Success(Some(notification)) =>
-            if (notification.updates.nonEmpty) {
-              clients.foreach { clientId =>
-                sessionRouter ! DeliverToJsonController(clientId, notification)
-              }
-            }
-          case Success(None) =>
-          case Failure(ex) =>
-            log.error(
-              s"Error applying suggestion database updates" +
-              s" ${msg.file} ${msg.version}. ${ex.getMessage}"
-            )
-        }
-
-    case Api.ExpressionUpdates(_, updates) =>
-      log.debug(
-        s"Received expression updates: " +
-        s"${updates.map(u => (u.expressionId, u.expressionType))}"
-      )
-      val types = updates.toSeq
-        .flatMap(update => update.expressionType.map(update.expressionId -> _))
-      suggestionsRepo
-        .updateAll(types)
-        .map { case (version, updatedIds) =>
-          val updates = types.zip(updatedIds).collect {
-            case ((_, typeValue), Some(suggestionId)) =>
-              SuggestionsDatabaseUpdate.Modify(
-                id         = suggestionId,
-                returnType = Some(fieldUpdate(typeValue))
-              )
+      case msg: Api.SuggestionsDatabaseModuleUpdateNotification =>
+        val isVersionChanged =
+          fileVersionsRepo.getVersion(msg.file).map { digestOpt =>
+            !digestOpt.map(ContentVersion(_)).contains(msg.version)
           }
-          SuggestionsDatabaseUpdateNotification(version, updates)
-        }
-        .onComplete {
-          case Success(notification) =>
-            if (notification.updates.nonEmpty) {
-              clients.foreach { clientId =>
-                sessionRouter ! DeliverToJsonController(clientId, notification)
-              }
-            }
-          case Failure(ex) =>
-            log.error(
-              s"Error applying changes from computed values: $updates. " +
-              s"${ex.getMessage}"
-            )
-        }
-
-    case GetSuggestionsDatabaseVersion =>
-      suggestionsRepo.currentVersion
-        .map(GetSuggestionsDatabaseVersionResult)
-        .pipeTo(sender())
-
-    case GetSuggestionsDatabase =>
-      suggestionsRepo.getAll
-        .map { case (version, entries) =>
-          GetSuggestionsDatabaseResult(
-            version,
-            entries.map(SuggestionDatabaseEntry(_))
-          )
-        }
-        .pipeTo(sender())
-
-    case Completion(path, pos, selfType, returnType, tags) =>
-      val selfTypes = selfType.toList.flatMap(ty => ty :: graph.getParents(ty))
-      getModuleName(projectName, path)
-        .fold(
-          Future.successful,
-          module =>
-            suggestionsRepo
-              .search(
-                Some(module),
-                selfTypes,
-                returnType,
-                tags.map(_.map(SuggestionKind.toSuggestion)),
-                Some(toPosition(pos))
-              )
-              .map(CompletionResult.tupled)
-        )
-        .pipeTo(sender())
-
-    case Import(suggestionId) =>
-      val action = for {
-        result <- suggestionsRepo.select(suggestionId)
-      } yield result
-        .map(SearchProtocol.ImportSuggestion)
-        .getOrElse(SearchProtocol.SuggestionNotFoundError)
-
-      val handler = context.system
-        .actorOf(ImportModuleHandler.props(config, timeout, runtimeConnector))
-      action.pipeTo(handler)(sender())
-
-    case FileDeletedEvent(path) =>
-      getModuleName(projectName, path)
-        .fold(
-          err => Future.successful(Left(err)),
-          module =>
-            suggestionsRepo
-              .removeModules(Seq(module))
-              .map { case (version, ids) =>
-                Right(
-                  SuggestionsDatabaseUpdateNotification(
-                    version,
-                    ids.map(SuggestionsDatabaseUpdate.Remove)
-                  )
-                )
-              }
-        )
-        .onComplete {
-          case Success(Right(notification)) =>
-            if (notification.updates.nonEmpty) {
-              clients.foreach { clientId =>
-                sessionRouter ! DeliverToJsonController(clientId, notification)
-              }
-            }
-          case Success(Left(err)) =>
-            log.error(
-              s"Error cleaning the index after file delete event. " +
-              s"$err"
-            )
-          case Failure(ex) =>
-            log.error(
-              s"Error cleaning the index after file delete event. " +
-              s"${ex.getMessage}"
-            )
-        }
-
-    case InvalidateSuggestionsDatabase =>
-      val action = for {
-        _ <- suggestionsRepo.clean
-        _ <- fileVersionsRepo.clean
-      } yield SearchProtocol.InvalidateModulesIndex
-
-      val handler = context.system
-        .actorOf(
-          InvalidateModulesIndexHandler.props(config, timeout, runtimeConnector)
-        )
-      action.pipeTo(handler)(sender())
-
-    case ProjectNameChangedEvent(oldName, newName) =>
-      suggestionsRepo
-        .renameProject(oldName, newName)
-        .map {
-          case (version, moduleIds, selfTypeIds, returnTypeIds, argumentIds) =>
-            val suggestionModuleUpdates = moduleIds.map {
-              case (suggestionId, moduleName) =>
-                SuggestionsDatabaseUpdate.Modify(
-                  id     = suggestionId,
-                  module = Some(fieldUpdate(moduleName))
-                )
-            }
-            val selfTypeUpdates = selfTypeIds.map {
-              case (suggestionId, selfType) =>
-                SuggestionsDatabaseUpdate.Modify(
-                  id       = suggestionId,
-                  selfType = Some(fieldUpdate(selfType))
-                )
-            }
-            val returnTypeUpdates = returnTypeIds.map {
-              case (suggestionId, returnType) =>
-                SuggestionsDatabaseUpdate.Modify(
-                  id         = suggestionId,
-                  returnType = Some(fieldUpdate(returnType))
-                )
-            }
-            val argumentUpdates =
-              argumentIds.groupBy(_._1).map { case (suggestionId, grouped) =>
-                val argumentUpdates = grouped.map { case (_, index, typeName) =>
-                  SuggestionArgumentUpdate.Modify(
-                    index    = index,
-                    reprType = Some(fieldUpdate(typeName))
+        val applyUpdatesIfVersionChanged =
+          isVersionChanged.flatMap { isChanged =>
+            if (isChanged) applyDatabaseUpdates(msg).map(Some(_))
+            else Future.successful(None)
+          }
+        applyUpdatesIfVersionChanged
+          .onComplete {
+            case Success(Some(notification)) =>
+              if (notification.updates.nonEmpty) {
+                clients.foreach { clientId =>
+                  sessionRouter ! DeliverToJsonController(
+                    clientId,
+                    notification
                   )
                 }
-                SuggestionsDatabaseUpdate.Modify(
-                  id        = suggestionId,
-                  arguments = Some(argumentUpdates)
-                )
               }
-            val notification =
-              SuggestionsDatabaseUpdateNotification(
-                version,
-                suggestionModuleUpdates ++ selfTypeUpdates ++ returnTypeUpdates ++ argumentUpdates
+            case Success(None) =>
+            case Failure(ex) =>
+              log.error(
+                s"Error applying suggestion database updates" +
+                s" ${msg.file} ${msg.version}. ${ex.getMessage}"
               )
-            val updates = clients.map(DeliverToJsonController(_, notification))
-            ProjectNameUpdated(newName, updates)
-        }
-        .pipeTo(self)
+          }
 
-    case ProjectNameUpdated(name, updates) =>
-      updates.foreach(sessionRouter ! _)
-      context.become(initialized(name, graph, clients))
-  }
+      case Api.ExpressionUpdates(_, updates) =>
+        log.debug(
+          s"Received expression updates: " +
+          s"${updates.map(u => (u.expressionId, u.expressionType))}"
+        )
+        val types = updates.toSeq
+          .flatMap(update =>
+            update.expressionType.map(update.expressionId -> _)
+          )
+        suggestionsRepo
+          .updateAll(types)
+          .map { case (version, updatedIds) =>
+            val updates = types.zip(updatedIds).collect {
+              case ((_, typeValue), Some(suggestionId)) =>
+                SuggestionsDatabaseUpdate.Modify(
+                  id         = suggestionId,
+                  returnType = Some(fieldUpdate(typeValue))
+                )
+            }
+            SuggestionsDatabaseUpdateNotification(version, updates)
+          }
+          .onComplete {
+            case Success(notification) =>
+              if (notification.updates.nonEmpty) {
+                clients.foreach { clientId =>
+                  sessionRouter ! DeliverToJsonController(
+                    clientId,
+                    notification
+                  )
+                }
+              }
+            case Failure(ex) =>
+              log.error(
+                s"Error applying changes from computed values: $updates. " +
+                s"${ex.getMessage}"
+              )
+          }
+
+      case GetSuggestionsDatabaseVersion =>
+        suggestionsRepo.currentVersion
+          .map(GetSuggestionsDatabaseVersionResult)
+          .pipeTo(sender())
+
+      case GetSuggestionsDatabase =>
+        suggestionsRepo.getAll
+          .map { case (version, entries) =>
+            GetSuggestionsDatabaseResult(
+              version,
+              entries.map(SuggestionDatabaseEntry(_))
+            )
+          }
+          .pipeTo(sender())
+
+      case Completion(path, pos, selfType, returnType, tags) =>
+        val selfTypes =
+          selfType.toList.flatMap(ty => ty :: graph.getParents(ty))
+        getModuleName(projectName, path)
+          .fold(
+            Future.successful,
+            module =>
+              suggestionsRepo
+                .search(
+                  Some(module),
+                  selfTypes,
+                  returnType,
+                  tags.map(_.map(SuggestionKind.toSuggestion)),
+                  Some(toPosition(pos))
+                )
+                .map(CompletionResult.tupled)
+          )
+          .pipeTo(sender())
+
+      case Import(suggestionId) =>
+        val action = for {
+          result <- suggestionsRepo.select(suggestionId)
+        } yield result
+          .map(SearchProtocol.ImportSuggestion)
+          .getOrElse(SearchProtocol.SuggestionNotFoundError)
+
+        val handler = context.system
+          .actorOf(ImportModuleHandler.props(config, timeout, runtimeConnector))
+        action.pipeTo(handler)(sender())
+
+      case FileDeletedEvent(path) =>
+        getModuleName(projectName, path)
+          .fold(
+            err => Future.successful(Left(err)),
+            module =>
+              suggestionsRepo
+                .removeModules(Seq(module))
+                .map { case (version, ids) =>
+                  Right(
+                    SuggestionsDatabaseUpdateNotification(
+                      version,
+                      ids.map(SuggestionsDatabaseUpdate.Remove)
+                    )
+                  )
+                }
+          )
+          .onComplete {
+            case Success(Right(notification)) =>
+              if (notification.updates.nonEmpty) {
+                clients.foreach { clientId =>
+                  sessionRouter ! DeliverToJsonController(
+                    clientId,
+                    notification
+                  )
+                }
+              }
+            case Success(Left(err)) =>
+              log.error(
+                s"Error cleaning the index after file delete event. " +
+                s"$err"
+              )
+            case Failure(ex) =>
+              log.error(
+                s"Error cleaning the index after file delete event. " +
+                s"${ex.getMessage}"
+              )
+          }
+
+      case InvalidateSuggestionsDatabase =>
+        val action = for {
+          _ <- suggestionsRepo.clean
+          _ <- fileVersionsRepo.clean
+        } yield SearchProtocol.InvalidateModulesIndex
+
+        val handler = context.system
+          .actorOf(
+            InvalidateModulesIndexHandler.props(
+              config,
+              timeout,
+              runtimeConnector
+            )
+          )
+        action.pipeTo(handler)(sender())
+
+      case ProjectNameChangedEvent(oldName, newName) =>
+        suggestionsRepo
+          .renameProject(oldName, newName)
+          .map {
+            case (
+                  version,
+                  moduleIds,
+                  selfTypeIds,
+                  returnTypeIds,
+                  argumentIds
+                ) =>
+              val suggestionModuleUpdates = moduleIds.map {
+                case (suggestionId, moduleName) =>
+                  SuggestionsDatabaseUpdate.Modify(
+                    id     = suggestionId,
+                    module = Some(fieldUpdate(moduleName))
+                  )
+              }
+              val selfTypeUpdates = selfTypeIds.map {
+                case (suggestionId, selfType) =>
+                  SuggestionsDatabaseUpdate.Modify(
+                    id       = suggestionId,
+                    selfType = Some(fieldUpdate(selfType))
+                  )
+              }
+              val returnTypeUpdates = returnTypeIds.map {
+                case (suggestionId, returnType) =>
+                  SuggestionsDatabaseUpdate.Modify(
+                    id         = suggestionId,
+                    returnType = Some(fieldUpdate(returnType))
+                  )
+              }
+              val argumentUpdates =
+                argumentIds.groupBy(_._1).map { case (suggestionId, grouped) =>
+                  val argumentUpdates =
+                    grouped.map { case (_, index, typeName) =>
+                      SuggestionArgumentUpdate.Modify(
+                        index    = index,
+                        reprType = Some(fieldUpdate(typeName))
+                      )
+                    }
+                  SuggestionsDatabaseUpdate.Modify(
+                    id        = suggestionId,
+                    arguments = Some(argumentUpdates)
+                  )
+                }
+              val notification =
+                SuggestionsDatabaseUpdateNotification(
+                  version,
+                  suggestionModuleUpdates ++ selfTypeUpdates ++ returnTypeUpdates ++ argumentUpdates
+                )
+              val updates =
+                clients.map(DeliverToJsonController(_, notification))
+              ProjectNameUpdated(newName, updates)
+          }
+          .pipeTo(self)
+
+      case ProjectNameUpdated(name, updates) =>
+        updates.foreach(sessionRouter ! _)
+        context.become(initialized(name, graph, clients))
+    }
 
   /** Transition the initialization process.
     *

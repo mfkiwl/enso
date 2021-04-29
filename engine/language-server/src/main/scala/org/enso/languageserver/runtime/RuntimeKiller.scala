@@ -3,6 +3,7 @@ package org.enso.languageserver.runtime
 import java.util.UUID
 
 import akka.actor.{Actor, ActorLogging, ActorRef, Cancellable, Props}
+import akka.event.LoggingReceive
 import org.enso.languageserver.runtime.RuntimeKiller._
 import org.enso.languageserver.util.UnhandledLogging
 import org.enso.polyglot.runtime.Runtime.Api
@@ -27,37 +28,40 @@ class RuntimeKiller(runtimeConnector: ActorRef, truffleContext: Context)
 
   override def receive: Receive = idle()
 
-  private def idle(): Receive = { case ShutDownRuntime =>
-    log.info("Shutting down the runtime server.")
-    runtimeConnector ! Api.Request(
-      UUID.randomUUID(),
-      Api.ShutDownRuntimeServer()
-    )
-    val cancellable =
-      context.system.scheduler
-        .scheduleOnce(5.seconds, self, ResourceDisposalTimeout)
-    context.become(shuttingDownRuntimeServer(sender(), cancellable))
-  }
+  private def idle(): Receive =
+    LoggingReceive.withLabel("idle") { case ShutDownRuntime =>
+      log.info("Shutting down the runtime server.")
+      runtimeConnector ! Api.Request(
+        UUID.randomUUID(),
+        Api.ShutDownRuntimeServer()
+      )
+      val cancellable =
+        context.system.scheduler
+          .scheduleOnce(5.seconds, self, ResourceDisposalTimeout)
+      context.become(shuttingDownRuntimeServer(sender(), cancellable))
+    }
 
   private def shuttingDownRuntimeServer(
     replyTo: ActorRef,
     cancellable: Cancellable
-  ): Receive = {
-    case ResourceDisposalTimeout =>
-      log.error("Disposal of runtime resources timed out.")
-      shutDownTruffle(replyTo)
+  ): Receive =
+    LoggingReceive.withLabel("shuttingDownRuntimeServer") {
+      case ResourceDisposalTimeout =>
+        log.error("Disposal of runtime resources timed out.")
+        shutDownTruffle(replyTo)
 
-    case Api.Response(_, Api.RuntimeServerShutDown()) =>
-      cancellable.cancel()
-      shutDownTruffle(replyTo)
-  }
+      case Api.Response(_, Api.RuntimeServerShutDown()) =>
+        cancellable.cancel()
+        shutDownTruffle(replyTo)
+    }
 
   private def shuttingDownTruffle(
     replyTo: ActorRef,
     retryCount: Int
-  ): Receive = { case TryToStopTruffle =>
-    shutDownTruffle(replyTo, retryCount)
-  }
+  ): Receive =
+    LoggingReceive.withLabel("shuttingDownTruffle") { case TryToStopTruffle =>
+      shutDownTruffle(replyTo, retryCount)
+    }
 
   private def shutDownTruffle(replyTo: ActorRef, retryCount: Int = 0): Unit = {
     try {

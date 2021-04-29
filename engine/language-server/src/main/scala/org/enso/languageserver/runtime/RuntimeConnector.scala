@@ -3,6 +3,7 @@ package org.enso.languageserver.runtime
 import java.nio.ByteBuffer
 
 import akka.actor.{Actor, ActorLogging, ActorRef, Props, Stash}
+import akka.event.LoggingReceive
 import org.enso.languageserver.util.UnhandledLogging
 import org.enso.languageserver.runtime.RuntimeConnector.Destroy
 import org.enso.polyglot.runtime.Runtime
@@ -20,16 +21,17 @@ class RuntimeConnector
     log.info("Starting the runtime connector.")
   }
 
-  override def receive: Receive = {
-    case RuntimeConnector.Initialize(engine) =>
-      log.info(
-        s"Runtime connector established connection with the message endpoint " +
-        s"$engine."
-      )
-      unstashAll()
-      context.become(initialized(engine, Map()))
-    case _ => stash()
-  }
+  override def receive: Receive =
+    LoggingReceive.withLabel("initializing") {
+      case RuntimeConnector.Initialize(engine) =>
+        log.info(
+          s"Runtime connector established connection with the message endpoint " +
+          s"$engine."
+        )
+        unstashAll()
+        context.become(initialized(engine, Map()))
+      case _ => stash()
+    }
 
   /** Performs communication between runtime and language server.
     * Requests are sent from language server to runtime,
@@ -41,21 +43,22 @@ class RuntimeConnector
   def initialized(
     engine: MessageEndpoint,
     senders: Map[Runtime.Api.RequestId, ActorRef]
-  ): Receive = {
-    case Destroy => context.stop(self)
-    case msg: Runtime.Api.Request =>
-      engine.sendBinary(Runtime.Api.serialize(msg))
-      msg.requestId.foreach { id =>
-        context.become(initialized(engine, senders + (id -> sender())))
-      }
-    case Runtime.Api.Response(None, msg: Runtime.ApiNotification) =>
-      context.system.eventStream.publish(msg)
-    case msg: Runtime.Api.Response =>
-      msg.correlationId.flatMap(senders.get).foreach(_ ! msg)
-      msg.correlationId.foreach { correlationId =>
-        context.become(initialized(engine, senders - correlationId))
-      }
-  }
+  ): Receive =
+    LoggingReceive.withLabel("initialized") {
+      case Destroy => context.stop(self)
+      case msg: Runtime.Api.Request =>
+        engine.sendBinary(Runtime.Api.serialize(msg))
+        msg.requestId.foreach { id =>
+          context.become(initialized(engine, senders + (id -> sender())))
+        }
+      case Runtime.Api.Response(None, msg: Runtime.ApiNotification) =>
+        context.system.eventStream.publish(msg)
+      case msg: Runtime.Api.Response =>
+        msg.correlationId.flatMap(senders.get).foreach(_ ! msg)
+        msg.correlationId.foreach { correlationId =>
+          context.become(initialized(engine, senders - correlationId))
+        }
+    }
 }
 
 object RuntimeConnector {
