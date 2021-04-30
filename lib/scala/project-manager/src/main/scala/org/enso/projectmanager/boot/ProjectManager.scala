@@ -55,9 +55,13 @@ object ProjectManager extends App with LazyLogging {
 
   /** Main process starting up the server.
     */
-  lazy val mainProcess: ZIO[ZEnv, IOException, Unit] = {
+  def mainProcess(logLevel: LogLevel): ZIO[ZEnv, IOException, Unit] = {
     val mainModule =
-      new MainModule[ZIO[ZEnv, +*, +*]](config, computeExecutionContext)
+      new MainModule[ZIO[ZEnv, +*, +*]](
+        config,
+        logLevel,
+        computeExecutionContext
+      )
     for {
       binding <- bindServer(mainModule)
       _       <- logServerStartup()
@@ -118,18 +122,22 @@ object ProjectManager extends App with LazyLogging {
     } else {
       val verbosity = options.getOptions.count(_ == Cli.option.verbose)
       logger.info("Starting Project Manager...")
-      setupLogging(verbosity) *>
-      mainProcess.fold(
-        th => {
-          logger.error("Main process execution failed.", th)
-          FailureExitCode
-        },
-        _ => SuccessExitCode
-      )
+      for {
+        logLevel <- setupLogging(verbosity)
+        exitCode <- mainProcess(logLevel).fold(
+          th => {
+            logger.error("Main process execution failed.", th)
+            FailureExitCode
+          },
+          _ => SuccessExitCode
+        )
+      } yield exitCode
     }
   }
 
-  private def setupLogging(verbosityLevel: Int): ZIO[Console, Nothing, Unit] = {
+  private def setupLogging(
+    verbosityLevel: Int
+  ): ZIO[Console, Nothing, LogLevel] = {
     val level = verbosityLevel match {
       case 0 => LogLevel.Info
       case 1 => LogLevel.Debug
@@ -147,6 +155,7 @@ object ProjectManager extends App with LazyLogging {
       .catchAll { exception =>
         putStrLnErr(s"Failed to setup the logger: $exception")
       }
+      .as(level)
   }
 
   private def displayVersion(

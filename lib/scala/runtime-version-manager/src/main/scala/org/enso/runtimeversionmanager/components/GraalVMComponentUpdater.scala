@@ -40,7 +40,7 @@ class GraalVMComponentUpdater(runtime: GraalRuntime)
     for {
       stdout <- Try(process.lazyLines(stderrLogger))
       _ = logger.trace(stdout.mkString(System.lineSeparator()))
-    } yield ListOut.parse(stdout)
+    } yield ListOut.parse(stdout.toVector)
   }
 
   /** Install the provided GraalVM components.
